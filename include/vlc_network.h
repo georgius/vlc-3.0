@@ -1,4 +1,4 @@
-/*****************************************************************************
+﻿/*****************************************************************************
  * vlc_network.h: interface to communicate with network plug-ins
  *****************************************************************************
  * Copyright (C) 2002-2005 VLC authors and VideoLAN
@@ -153,6 +153,10 @@ static inline int net_ConnectUDP (vlc_object_t *obj, const char *host, int port,
 VLC_API int net_OpenDgram( vlc_object_t *p_this, const char *psz_bind, int i_bind, const char *psz_server, int i_server, int proto );
 #define net_OpenDgram( a, b, c, d, e, g ) \
         net_OpenDgram(VLC_OBJECT(a), b, c, d, e, g)
+
+VLC_API int net_OpenDgramRaw( vlc_object_t *p_this, const char *psz_bind, int i_bind, const char *psz_server, int i_server, int proto );
+#define net_OpenDgramRaw( a, b, c, d, e, g ) \
+        net_OpenDgramRaw(VLC_OBJECT(a), b, c, d, e, g)
 
 static inline int net_ListenUDP1 (vlc_object_t *obj, const char *host, int port)
 {
