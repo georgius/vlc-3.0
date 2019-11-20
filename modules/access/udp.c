@@ -81,6 +81,24 @@ struct access_sys_t
     int fd;
     int timeout;
     size_t mtu;
+	
+	/* specific IGMP data */
+	int igmp_fd;
+	uint8_t dscp;
+	uint8_t ecn;
+	uint16_t identification;
+	uint8_t ttl;
+	uint32_t igmpInterval;
+	
+	char *nic_name;
+	
+	struct sockaddr_in *nic_address;
+	size_t nic_address_length;
+	
+	struct addrinfo *igmp_address;
+	size_t igmp_address_length;
+	
+	uint32_t lastIgmpPacket;
 };
 
 /*****************************************************************************
@@ -88,6 +106,258 @@ struct access_sys_t
  *****************************************************************************/
 static block_t *BlockUDP( stream_t *, bool * );
 static int Control( stream_t *, int, va_list );
+
+static uint16_t CalculateChecksum(uint8_t *payload, uint16_t length)
+{
+  uint32_t result = 0;
+
+  if ((payload != NULL) && (length > 0) && ((length % 2) == 0))
+  {
+    for (uint16_t i = 0; i < length; i++)
+    {
+      result += ((*(payload + i)) << 8) + (*(payload + i + 1));
+      i++;
+    }
+
+    while (result > 0x0000FFFF)
+    {
+      uint16_t carry = (result >> 16);
+
+      result &= 0x0000FFFF;
+      result += carry;
+    }
+  }
+
+  return (uint16_t)(~result);
+}
+
+static void net_UnsubscribeRaw (vlc_object_t *p_this)
+{
+	stream_t     *p_access = (stream_t*)p_this;
+	access_sys_t *sys = p_access->p_sys;
+	
+	msg_Dbg (p_this, "(net_UnsubscribeRaw): unsubscribing from multicast group");
+	
+	// try to subscribe with raw IGMP packet
+			
+	unsigned char *igmpPacket = NULL;
+	unsigned char *ipv4Packet = NULL;
+	
+	uint16_t ipv4PacketHeaderLength = 0x18;
+	uint16_t ipv4PacketLength = ipv4PacketHeaderLength + 0x08;
+	
+	igmpPacket = malloc( 0x08 );
+	ipv4Packet = malloc( ipv4PacketLength );
+	
+	if ((igmpPacket != NULL) && (ipv4Packet != NULL))
+	{
+		memset(igmpPacket, 0, 0x08);
+		memset(ipv4Packet, 0, ipv4PacketLength);
+		
+		// prepare IGMP packet
+		
+		// IGMPv2 type
+		*igmpPacket = 0x17;
+
+		// IGMPv2 max response time
+		*(igmpPacket + 1) = 0;
+
+		// IGMPv2 checksum (skip)
+		
+		// IGMPv2 group address
+		memcpy(igmpPacket + 4, &((struct sockaddr_in *)sys->igmp_address)->sin_addr.S_un.S_addr, 4);
+
+		// calculate IGMPv2 payload checksum
+		uint16_t checksum = CalculateChecksum(igmpPacket, 0x08);
+
+		// update IGMPv2 checksum
+		*(igmpPacket + 2) = ((checksum & 0xFF00) >> 8);
+		*(igmpPacket + 3) = (checksum & 0x00FF);
+		
+		// prepare IPv4 packet
+		
+		uint8_t ihl = ipv4PacketHeaderLength / 4;
+
+		// version field is always 4
+		*(ipv4Packet) = (0x40 + ihl);
+
+		// DSCP and ECN fields
+		*(ipv4Packet + 1) = ((sys->dscp << 2) + sys->ecn);
+
+		// total length of IPV4 packet
+		*(ipv4Packet + 2) = (ipv4PacketLength >> 8);
+		*(ipv4Packet + 3) = (ipv4PacketLength & 0x00FF);
+
+		// IPV4 packet identification
+		*(ipv4Packet + 4) = (sys->identification >> 8);
+		*(ipv4Packet + 5) = (sys->identification & 0x00FF);
+
+		// IPV4 flags and fragment offset (always 0)
+		*(ipv4Packet + 6) = 0x40; // don't fragment
+
+		*(ipv4Packet + 7) = 0x00;
+
+		*(ipv4Packet + 8) = sys->ttl;
+		*(ipv4Packet + 9) = 0x02;
+
+		// IPV4 source address
+		memcpy(ipv4Packet + 12, &sys->nic_address->sin_addr.S_un.S_addr, 4);
+
+		// IPV4 destination address
+		memcpy(ipv4Packet + 16, &((struct sockaddr_in *)sys->igmp_address)->sin_addr.S_un.S_addr, 4);
+
+		// IPV4 options
+		*(ipv4Packet + 20) = 0x94;
+		*(ipv4Packet + 21) = 0x04;
+		*(ipv4Packet + 22) = 0x00;
+		*(ipv4Packet + 23) = 0x00;
+
+		// calculate IPv4 header checksum
+		checksum = CalculateChecksum(ipv4Packet, ipv4PacketHeaderLength);
+
+		// update IPv4 header checksum
+		*(ipv4Packet + 10) = ((checksum & 0xFF00) >> 8);
+		*(ipv4Packet + 11) = (checksum & 0x00FF);
+
+		// add IGMPv2 payload
+		memcpy(ipv4Packet + ipv4PacketHeaderLength, igmpPacket, 0x08);
+		
+		// everything correct, try to send IGMP packet
+		if (sendto(sys->igmp_fd, ipv4Packet, ipv4PacketLength, 0, sys->igmp_address, sys->igmp_address_length) == SOCKET_ERROR)
+		{
+			msg_Err (p_this, "(net_UnsubscribeRaw) sendto() error: %s", vlc_strerror_c(net_errno));
+		}
+	}
+	else
+	{
+		msg_Err (p_this, "(net_UnsubscribeRaw) not enough memory for IGMP or IPV4 packet");
+	}
+	
+	if (igmpPacket != NULL)
+	{
+		free(igmpPacket);
+	}
+	if (ipv4Packet != NULL)
+	{
+		free(ipv4Packet);
+	}
+}
+
+static int net_SubscribeRaw (stream_t *access)
+{
+	access_sys_t *sys = access->p_sys;
+	int result = 0;
+	
+	msg_Dbg (access, "(net_SubscribeRaw): subscribing to multicast group");
+	
+	// try to subscribe with raw IGMP packet
+			
+	unsigned char *igmpPacket = NULL;
+	unsigned char *ipv4Packet = NULL;
+	
+	uint16_t ipv4PacketHeaderLength = 0x18;
+	uint16_t ipv4PacketLength = ipv4PacketHeaderLength + 0x08;
+	
+	igmpPacket = malloc( 0x08 );
+	ipv4Packet = malloc( ipv4PacketLength );
+	
+	if ((igmpPacket != NULL) && (ipv4Packet != NULL))
+	{
+		memset(igmpPacket, 0, 0x08);
+		memset(ipv4Packet, 0, ipv4PacketLength);
+		
+		// prepare IGMP packet
+		
+		// IGMPv2 type
+		*igmpPacket = 0x16;
+
+		// IGMPv2 max response time
+		*(igmpPacket + 1) = 0;
+
+		// IGMPv2 checksum (skip)
+		
+		// IGMPv2 group address
+		memcpy(igmpPacket + 4, &((struct sockaddr_in *)sys->igmp_address)->sin_addr.S_un.S_addr, 4);
+
+		// calculate IGMPv2 payload checksum
+		uint16_t checksum = CalculateChecksum(igmpPacket, 0x08);
+
+		// update IGMPv2 checksum
+		*(igmpPacket + 2) = ((checksum & 0xFF00) >> 8);
+		*(igmpPacket + 3) = (checksum & 0x00FF);
+		
+		// prepare IPv4 packet
+		
+		uint8_t ihl = ipv4PacketHeaderLength / 4;
+
+		// version field is always 4
+		*(ipv4Packet) = (0x40 + ihl);
+
+		// DSCP and ECN fields
+		*(ipv4Packet + 1) = ((sys->dscp << 2) + sys->ecn);
+
+		// total length of IPV4 packet
+		*(ipv4Packet + 2) = (ipv4PacketLength >> 8);
+		*(ipv4Packet + 3) = (ipv4PacketLength & 0x00FF);
+
+		// IPV4 packet identification
+		*(ipv4Packet + 4) = (sys->identification >> 8);
+		*(ipv4Packet + 5) = (sys->identification & 0x00FF);
+
+		// IPV4 flags and fragment offset (always 0)
+		*(ipv4Packet + 6) = 0x40; // don't fragment
+
+		*(ipv4Packet + 7) = 0x00;
+
+		*(ipv4Packet + 8) = sys->ttl;
+		*(ipv4Packet + 9) = 0x02;
+
+		// IPV4 source address
+		memcpy(ipv4Packet + 12, &sys->nic_address->sin_addr.S_un.S_addr, 4);
+
+		// IPV4 destination address
+		memcpy(ipv4Packet + 16, &((struct sockaddr_in *)sys->igmp_address)->sin_addr.S_un.S_addr, 4);
+
+		// IPV4 options
+		*(ipv4Packet + 20) = 0x94;
+		*(ipv4Packet + 21) = 0x04;
+		*(ipv4Packet + 22) = 0x00;
+		*(ipv4Packet + 23) = 0x00;
+
+		// calculate IPv4 header checksum
+		checksum = CalculateChecksum(ipv4Packet, ipv4PacketHeaderLength);
+
+		// update IPv4 header checksum
+		*(ipv4Packet + 10) = ((checksum & 0xFF00) >> 8);
+		*(ipv4Packet + 11) = (checksum & 0x00FF);
+
+		// add IGMPv2 payload
+		memcpy(ipv4Packet + ipv4PacketHeaderLength, igmpPacket, 0x08);
+		
+		// everything correct, try to send IGMP packet
+		if (sendto(sys->igmp_fd, ipv4Packet, ipv4PacketLength, 0, sys->igmp_address, sys->igmp_address_length) == SOCKET_ERROR)
+		{
+			msg_Err (access, "(net_SubscribeRaw) sendto() error: %s", vlc_strerror_c(net_errno));
+			result = VLC_EGENERIC;
+		}
+	}
+	else
+	{
+		msg_Err (access, "(net_SubscribeRaw) not enough memory for IGMP or IPV4 packet");
+		result = VLC_ENOMEM;
+	}
+	
+	if (igmpPacket != NULL)
+	{
+		free(igmpPacket);
+	}
+	if (ipv4Packet != NULL)
+	{
+		free(ipv4Packet);
+	}
+	
+	return result;
+}
 
 /*****************************************************************************
  * Open: open the socket
@@ -103,6 +373,24 @@ static int Open( vlc_object_t *p_this )
     sys = vlc_obj_malloc( p_this, sizeof( *sys ) );
     if( unlikely( sys == NULL ) )
         return VLC_ENOMEM;
+	
+	sys->fd = -1;
+	sys->igmp_fd = -1;
+	sys->dscp = 0;
+	sys->ecn = 0;
+#ifdef _WIN32
+	sys->identification = GetTickCount();
+#else
+	sys->identification = 0x0000;
+#endif
+	sys->ttl = 1;
+	sys->igmpInterval = 30000;
+	sys->nic_name = NULL;
+	sys->nic_address = NULL;
+	sys->nic_address_length = 0;
+	sys->igmp_address = NULL;
+	sys->igmp_address_length = 0;
+	sys->lastIgmpPacket = 0;
 
     p_access->p_sys = sys;
 
@@ -116,7 +404,7 @@ static int Open( vlc_object_t *p_this )
 
     if( unlikely(psz_name == NULL) )
         return VLC_ENOMEM;
-
+	
     /* Parse psz_name syntax :
      * [serveraddr[:serverport]][@[bindaddr]:[bindport]] */
     psz_parser = strchr( psz_name, '@' );
@@ -155,16 +443,146 @@ static int Open( vlc_object_t *p_this )
             i_server_port = atoi( psz_parser );
         }
     }
+	
+	char *psz_params = strchr( p_access->psz_location, '?' );
+	if (psz_params != NULL)
+	{
+		psz_params++;
+		
+		do
+		{
+			char *psz_next_param = strchr(psz_params, '&');
+			
+			size_t param_len = (psz_next_param != NULL) ? (size_t)(psz_next_param - psz_params) : strlen(psz_params);
+			param_len++;
+			
+			char *psz_param = malloc(param_len * sizeof(char));
+			
+			if (psz_next_param != NULL)
+			{
+				psz_next_param++;
+			}
+			
+			if (psz_param != NULL)
+			{
+				memset(psz_param, 0, param_len);
+				strncpy(psz_param, psz_params, (param_len - 1));
+				
+				char *psz_param_value = strchr(psz_param, '=');
+				if (psz_param_value != NULL)
+				{
+					size_t param_name_len = psz_param_value - psz_param;
+					param_name_len++;
+					psz_param_value++;
+					
+					char *psz_param_name = malloc(param_name_len * sizeof(char));
+					if (psz_param_name != NULL)
+					{
+						memset(psz_param_name, 0, param_name_len);
+						strncpy(psz_param_name, psz_param, (param_name_len - 1));
+						
+						if (stricmp(psz_param_name, "interface") == 0)
+						{
+							// interface
+							size_t psz_param_value_len = strlen(psz_param_value);
+							psz_param_value_len++;
+					
+							sys->nic_name = malloc(psz_param_value_len * sizeof(char));
+							
+							if (sys->nic_name != NULL)
+							{
+								memset(sys->nic_name, 0, psz_param_value_len);
+								strncpy(sys->nic_name, psz_param_value, psz_param_value_len - 1);
+							}
+						}
+						else if (stricmp(psz_param_name, "dscp") == 0)
+						{
+							// DSCP
+					
+							sys->dscp = atoi(psz_param_value);
+						}
+						else if (stricmp(psz_param_name, "ecn") == 0)
+						{
+							// ECN
 
-    msg_Dbg( p_access, "opening server=%s:%d local=%s:%d",
+							sys->ecn = atoi(psz_param_value);
+						}
+						else if (stricmp(psz_param_name, "identification") == 0)
+						{
+							// identification
+					
+							sys->identification = atoi(psz_param_value);
+						}
+						else if (stricmp(psz_param_name, "ttl") == 0)
+						{
+							// TTL
+					
+							sys->ttl = atoi(psz_param_value);
+						}
+						else if (stricmp(psz_param_name, "igmpinterval") == 0)
+						{
+							// IGMP interval
+					
+							sys->igmpInterval = atoi(psz_param_value);
+						}
+						
+						free(psz_param_name);
+					}
+				}
+				
+				free(psz_param);
+				psz_param = NULL;
+			}
+			
+			psz_params = psz_next_param;
+		}
+		while (psz_params != NULL);
+		
+		msg_Dbg( p_access, "interface: '%s'", (sys->nic_name == NULL) ? "NULL" : sys->nic_name );
+		msg_Dbg( p_access, "DSCP: %d", sys->dscp );
+		msg_Dbg( p_access, "ECN: %d", sys->ecn );
+		msg_Dbg( p_access, "TTL: %d", sys->ttl );
+		msg_Dbg( p_access, "identification: %d", sys->identification );
+		msg_Dbg( p_access, "IGMP interval: %d (ms)", sys->igmpInterval );
+	}
+	
+	msg_Dbg( p_access, "opening raw server=%s:%d local=%s:%d",
+             psz_server_addr, i_server_port, psz_bind_addr, i_bind_port );
+			 
+	sys->igmp_fd = net_OpenDgramRaw( p_access, psz_bind_addr, i_bind_port,
+			psz_server_addr, i_server_port, 0x02 );
+    
+	if ( sys->igmp_fd != -1)
+	{
+#ifdef _WIN32		
+		sys->lastIgmpPacket = GetTickCount();
+#else
+		sys->lastIgmpPacket = 0x00000000;
+#endif	
+		
+		msg_Dbg( p_access, "opening server=%s:%d local=%s:%d",
              psz_server_addr, i_server_port, psz_bind_addr, i_bind_port );
 
-    sys->fd = net_OpenDgram( p_access, psz_bind_addr, i_bind_port,
-                             psz_server_addr, i_server_port, IPPROTO_UDP );
+		sys->fd = net_OpenDgram( p_access, psz_bind_addr, i_bind_port,
+			psz_server_addr, i_server_port, IPPROTO_UDP );	
+	}
+	
     free( psz_name );
-    if( sys->fd == -1 )
+	
+    if( sys->igmp_fd == -1 )
+    {
+        msg_Err( p_access, "cannot open raw socket" );
+        return VLC_EGENERIC;
+    }
+	
+	if( sys->fd == -1 )
     {
         msg_Err( p_access, "cannot open socket" );
+		
+		net_UnsubscribeRaw( p_this );
+		net_Close( sys->igmp_fd );
+		sys->igmp_fd = -1;
+		
         return VLC_EGENERIC;
     }
 
@@ -185,7 +603,35 @@ static void Close( vlc_object_t *p_this )
     stream_t     *p_access = (stream_t*)p_this;
     access_sys_t *sys = p_access->p_sys;
 
-    net_Close( sys->fd );
+	if ( sys->igmp_fd != -1)
+	{
+		net_UnsubscribeRaw(p_this);
+		net_Close( sys->igmp_fd );
+		sys->igmp_fd = -1;
+	}
+	if ( sys->fd != -1)
+	{
+		net_Close( sys->fd );
+		sys->fd = -1;
+	}
+	
+	if (sys->nic_name != NULL)
+	{
+		free(sys->nic_name);
+		sys->nic_name = NULL;
+	}
+	if (sys->nic_address != NULL)
+	{
+		free(sys->nic_address);
+		sys->nic_address = NULL;
+		sys->nic_address_length = 0;
+	}
+	if (sys->igmp_address != NULL)
+	{
+		free(sys->igmp_address);
+		sys->igmp_address = NULL;
+		sys->igmp_address_length = 0;
+	}
 }
 
 /*****************************************************************************
@@ -224,6 +670,20 @@ static int Control( stream_t *p_access, int i_query, va_list args )
 static block_t *BlockUDP(stream_t *access, bool *restrict eof)
 {
     access_sys_t *sys = access->p_sys;
+#ifdef _WIN32
+	uint32_t current = GetTickCount();
+	
+	if (current > (sys->lastIgmpPacket + sys->igmpInterval))
+	{
+		if (!net_SubscribeRaw(access))
+		{
+			sys->lastIgmpPacket = current;
+		}
+	}
+#else
+	net_SubscribeRaw(access);
+	sys->lastIgmpPacket = 0x00000000;
+#endif	
 
     block_t *pkt = block_Alloc(sys->mtu);
     if (unlikely(pkt == NULL))

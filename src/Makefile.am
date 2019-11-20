@@ -369,6 +369,7 @@ libvlccore_la_SOURCES += \
 	win32/specific.c \
 	win32/thread.c \
 	win32/winsock.c
+libvlccore_la_LIBADD += -liphlpapi
 if HAVE_WINSTORE
 libvlccore_la_SOURCES += posix/timer.c
 else
